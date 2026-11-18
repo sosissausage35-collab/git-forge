@@ -8,7 +8,7 @@
 // then poll GET $MAKEFUN_ENV_URL/done until {"done": true} and exit 0.
 // Without MAKEFUN_ENV_URL it just serves and keeps running.
 
-import http from 'node:http';
+import net from 'node:net';
 import zlib from 'node:zlib';
 import crypto from 'node:crypto';
 
@@ -1171,8 +1171,8 @@ function commentView(repo: Repo, issueNumber: number, comment: Comment): Record<
 // ---------------------------------------------------------------- HTTP helpers
 
 interface Ctx {
-  req: http.IncomingMessage;
-  res: http.ServerResponse;
+  req: RawReq;
+  res: RawRes;
   method: string;
   url: URL;
   path: string;
@@ -1218,22 +1218,10 @@ function sendJsonRaw(ctx: Ctx, status: number, json: string, extraHeaders?: Reco
   ctx.res.end(json);
 }
 
-function readBody(req: http.IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    // Small bodies (the common case) arrive in one chunk: skip the concat.
-    let first: Buffer | null = null;
-    let rest: Buffer[] | null = null;
-    req.on('data', (c: Buffer) => {
-      if (first === null) first = c;
-      else (rest ??= []).push(c);
-    });
-    req.on('end', () => {
-      if (first === null) resolve(Buffer.alloc(0));
-      else if (rest === null) resolve(first);
-      else resolve(Buffer.concat([first, ...rest]));
-    });
-    req.on('error', reject);
-  });
+function readBody(req: RawReq): Promise<Buffer> {
+  // The raw transport reads the whole body before dispatching, so this is
+  // just the buffered body. Kept async so callers are unchanged.
+  return Promise.resolve(req.body);
 }
 
 function parseJsonBody(ctx: Ctx): boolean {
@@ -3496,7 +3484,7 @@ function handleReceivePack(ctx: Ctx, repo: Repo): boolean {
 const SHOP_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 const ENV_URL = process.env.MAKEFUN_ENV_URL ?? '';
 
-function isAuthorized(req: http.IncomingMessage): boolean {
+function isAuthorized(req: RawReq): boolean {
   const h = req.headers.authorization;
   if (typeof h !== 'string' || !h.startsWith('Bearer ')) return false;
   const tok = h.slice('Bearer '.length).trim();
@@ -3505,7 +3493,7 @@ function isAuthorized(req: http.IncomingMessage): boolean {
   return true;
 }
 
-async function onRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+async function onRequest(req: RawReq, res: RawRes): Promise<void> {
   let url: URL;
   try {
     const host = req.headers.host ?? '127.0.0.1';
@@ -3562,18 +3550,290 @@ async function onRequest(req: http.IncomingMessage, res: http.ServerResponse): P
   }
 }
 
-const server = http.createServer((req, res) => {
-  void onRequest(req, res);
+// ---------------------------------------------------------------- raw TCP transport
+//
+// The Node http server is replaced by a raw TCP server plus a hand-rolled
+// HTTP/1.1 parser. The handler interface is unchanged: onRequest receives a
+// RawReq (method, request target, lowercased headers, pre-read body) and a
+// RawRes with writeHead/end. This cuts the Node http machinery (its parser,
+// the stream layers, and their GC pressure) from the hot path: the read
+// workload is 2,000 sequential GETs on one keep-alive connection, and the
+// profiler showed handler JS at ~4% of CPU with the rest in writev, the
+// HTTP parser, GC and streams.
+
+interface RawReq {
+  method: string;
+  url: string;
+  headers: Record<string, string | undefined>;
+  body: Buffer;
+}
+
+const REASON: Record<number, string> = {
+  200: 'OK',
+  201: 'Created',
+  202: 'Accepted',
+  204: 'No Content',
+  400: 'Bad Request',
+  401: 'Unauthorized',
+  403: 'Forbidden',
+  404: 'Not Found',
+  405: 'Method Not Allowed',
+  409: 'Conflict',
+  422: 'Unprocessable Entity',
+  500: 'Internal Server Error',
+};
+
+const EMPTY_BUF = Buffer.alloc(0);
+const MAX_HEADER_BYTES = 65536;
+const MAX_BODY_BYTES = 67108864;
+
+interface Conn {
+  sock: net.Socket;
+  buf: Buffer;
+  busy: boolean;
+  dead: boolean;
+  sent100: boolean;
+}
+
+class RawRes {
+  private conn: Conn;
+  private keepAlive: boolean;
+  private isHead: boolean;
+  private status = 200;
+  private headers: Record<string, string> = {};
+  private ended = false;
+
+  constructor(conn: Conn, keepAlive: boolean, isHead: boolean) {
+    this.conn = conn;
+    this.keepAlive = keepAlive;
+    this.isHead = isHead;
+  }
+
+  writeHead(status: number, headers: Record<string, string>): void {
+    if (this.ended) return;
+    this.status = status;
+    this.headers = headers;
+  }
+
+  end(body?: string | Buffer): void {
+    if (this.ended) return;
+    this.ended = true;
+    const conn = this.conn;
+    const b: Buffer | null =
+      body === undefined || this.isHead ? null : typeof body === 'string' ? Buffer.from(body) : body;
+    let head = `HTTP/1.1 ${this.status} ${REASON[this.status] ?? 'OK'}\r\n`;
+    const h = this.headers;
+    for (const k in h) head += `${k}: ${h[k]}\r\n`;
+    head += this.keepAlive ? 'connection: keep-alive\r\n\r\n' : 'connection: close\r\n\r\n';
+    const hb = Buffer.from(head, 'latin1');
+    if (b === null || b.length === 0) {
+      conn.sock.write(hb);
+    } else {
+      // Two writes in one tick are batched into one writev by the stream.
+      conn.sock.write(hb);
+      conn.sock.write(b);
+    }
+    if (!this.keepAlive) {
+      conn.dead = true;
+      conn.sock.end();
+    }
+    conn.busy = false;
+    // Defer so a pipelined burst cannot recurse through end() calls.
+    queueMicrotask(() => pump(conn));
+  }
+}
+
+function failConn(conn: Conn): void {
+  if (conn.dead) return;
+  conn.dead = true;
+  try {
+    conn.sock.write('HTTP/1.1 400 Bad Request\r\nconnection: close\r\ncontent-length: 0\r\n\r\n');
+  } catch {
+    // The socket is already gone; nothing more to do.
+  }
+  conn.sock.end();
+}
+
+// Decode one chunked body starting at pos. Returns null when more data is
+// needed; throws on a malformed chunk stream (the caller fails the socket).
+function decodeChunked(buf: Buffer, pos: number): { body: Buffer; next: number } | null {
+  const parts: Buffer[] = [];
+  let p = pos;
+  for (;;) {
+    const lineEnd = buf.indexOf('\r\n', p);
+    if (lineEnd === -1) return null;
+    const sizeLine = buf.toString('latin1', p, lineEnd).trim();
+    const semi = sizeLine.indexOf(';');
+    const size = parseInt(semi === -1 ? sizeLine : sizeLine.slice(0, semi), 16);
+    if (!Number.isInteger(size) || size < 0 || size > MAX_BODY_BYTES) throw new Error('bad chunk size');
+    p = lineEnd + 2;
+    if (size === 0) {
+      // Trailers, if any, end at the first empty line.
+      for (;;) {
+        const e = buf.indexOf('\r\n', p);
+        if (e === -1) return null;
+        if (e === p) {
+          p = e + 2;
+          break;
+        }
+        p = e + 2;
+      }
+      return {
+        body: parts.length === 0 ? EMPTY_BUF : parts.length === 1 ? parts[0] : Buffer.concat(parts),
+        next: p,
+      };
+    }
+    if (buf.length - p < size + 2) return null;
+    parts.push(buf.subarray(p, p + size));
+    p += size + 2;
+  }
+}
+
+// Parse and dispatch complete requests buffered on conn, in order. One
+// request runs at a time per connection; the next is pumped when RawRes.end
+// runs (or when more data arrives while idle).
+function pump(conn: Conn): void {
+  for (;;) {
+    if (conn.busy || conn.dead) return;
+    const buf = conn.buf;
+    const hEnd = buf.indexOf('\r\n\r\n');
+    if (hEnd === -1) {
+      if (buf.length > MAX_HEADER_BYTES) failConn(conn);
+      return;
+    }
+    let req: RawReq;
+    let keepAlive: boolean;
+    let isHead = false;
+    let next: number;
+    try {
+      const head = buf.toString('latin1', 0, hEnd);
+      const lines = head.split('\r\n');
+      const rl = lines[0].split(' ');
+      if (rl.length !== 3 || rl[0] === '' || rl[1] === '' || !rl[2].startsWith('HTTP/')) {
+        failConn(conn);
+        return;
+      }
+      const headers: Record<string, string | undefined> = {};
+      for (let i = 1; i < lines.length; i++) {
+        const c = lines[i].indexOf(':');
+        if (c <= 0) {
+          failConn(conn);
+          return;
+        }
+        const name = lines[i].slice(0, c).trim().toLowerCase();
+        const value = lines[i].slice(c + 1).trim();
+        const prev = headers[name];
+        headers[name] = prev === undefined ? value : prev + ', ' + value;
+      }
+      const method = rl[0];
+      const target = rl[1];
+      const version = rl[2];
+      isHead = method === 'HEAD';
+      const connHeader = headers['connection'];
+      keepAlive =
+        version === 'HTTP/1.1'
+          ? !(connHeader !== undefined && connHeader.toLowerCase().includes('close'))
+          : connHeader !== undefined && connHeader.toLowerCase().includes('keep-alive');
+      let pos = hEnd + 4;
+      // 100-continue: answer at once so the client starts sending the body
+      // (curl, and with it real git, waits for it on larger POST bodies).
+      if (
+        headers['expect'] !== undefined &&
+        headers['expect'].toLowerCase() === '100-continue' &&
+        !conn.sent100
+      ) {
+        conn.sent100 = true;
+        conn.sock.write('HTTP/1.1 100 Continue\r\n\r\n');
+      }
+      const te = headers['transfer-encoding'];
+      const cl = headers['content-length'];
+      let body: Buffer;
+      if (te !== undefined && te.toLowerCase().includes('chunked')) {
+        const dec = decodeChunked(buf, pos);
+        if (dec === null) return;
+        body = dec.body;
+        next = dec.next;
+      } else if (cl !== undefined) {
+        const len = Number(cl);
+        if (!Number.isInteger(len) || len < 0 || len > MAX_BODY_BYTES) {
+          failConn(conn);
+          return;
+        }
+        if (buf.length - pos < len) return;
+        body = len === 0 ? EMPTY_BUF : buf.subarray(pos, pos + len);
+        next = pos + len;
+      } else {
+        body = EMPTY_BUF;
+        next = pos;
+      }
+      req = { method, url: target, headers, body };
+    } catch {
+      failConn(conn);
+      return;
+    }
+    conn.buf = next >= buf.length ? EMPTY_BUF : buf.subarray(next);
+    conn.sent100 = false;
+    conn.busy = true;
+    const res = new RawRes(conn, keepAlive, isHead);
+    try {
+      void onRequest(req, res).catch(() => {
+        // onRequest already answers 500 on error; if it somehow never
+        // answered, close the connection rather than stalling it.
+        if (!conn.dead) {
+          conn.dead = true;
+          conn.sock.destroy();
+        }
+      });
+    } catch {
+      if (!conn.dead) {
+        conn.dead = true;
+        conn.sock.destroy();
+      }
+    }
+    return;
+  }
+}
+
+const openSockets = new Set<net.Socket>();
+
+const server = net.createServer((sock) => {
+  sock.setNoDelay(true);
+  const conn: Conn = { sock, buf: EMPTY_BUF, busy: false, dead: false, sent100: false };
+  openSockets.add(sock);
+  sock.on('data', (chunk: Buffer) => {
+    if (conn.dead) return;
+    conn.buf = conn.buf.length === 0 ? chunk : Buffer.concat([conn.buf, chunk]);
+    pump(conn);
+  });
+  sock.on('error', () => {
+    conn.dead = true;
+    openSockets.delete(sock);
+    sock.destroy();
+  });
+  sock.on('close', () => {
+    conn.dead = true;
+    openSockets.delete(sock);
+  });
 });
 
-process.on('SIGTERM', () => {
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 2000).unref();
-});
-process.on('SIGINT', () => {
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 2000).unref();
-});
+function shutdown(): void {
+  try {
+    server.close();
+  } catch {
+    // Already closed; nothing more to do.
+  }
+  for (const s of openSockets) {
+    try {
+      s.destroy();
+    } catch {
+      // Already gone.
+    }
+  }
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => shutdown());
+process.on('SIGINT', () => shutdown());
 
 async function registerAndPoll(port: number): Promise<void> {
   const base = ENV_URL.replace(/\/+$/, '');
@@ -3597,8 +3857,7 @@ async function registerAndPoll(port: number): Promise<void> {
       const res = await fetch(`${base}/done`, { signal: AbortSignal.timeout(30000) });
       const body = (await res.json()) as Record<string, unknown>;
       if (body.done === true) {
-        server.close(() => process.exit(0));
-        setTimeout(() => process.exit(0), 2000);
+        shutdown();
         return;
       }
     } catch {
