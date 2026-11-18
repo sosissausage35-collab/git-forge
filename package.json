@@ -1,0 +1,1 @@
+{"description":"A GitHub-compatible git forge in a single Node.js process (git smart HTTP, REST v3, GraphQL, MCP)","license":"MIT","name":"git-forge","private":true,"type":"module","version":"1.0.0"}
